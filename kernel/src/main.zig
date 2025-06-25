@@ -4,7 +4,7 @@ const BootInfo = @import("BootInfo");
 const framebuffer = @import("framebuffer.zig");
 const panic_font = @embedFile("panic_font");
 
-pub var boot_info: BootInfo = undefined;
+pub var boot_info: *BootInfo = undefined;
 
 pub const panic = std.debug.FullPanic(panicHandler);
 
@@ -69,7 +69,7 @@ pub const std_options: std.Options = .{
     .logFn = logFn,
 };
 
-pub fn logFn(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
+fn logFn(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
     _ = level;
     _ = scope;
     _ = format;
@@ -78,11 +78,15 @@ pub fn logFn(comptime level: std.log.Level, comptime scope: @Type(.enum_literal)
     // TODO
 }
 
-pub const main = boot.main;
-
-pub fn kmain(_boot_info: BootInfo) noreturn {
+export fn _start(magic: usize, _boot_info: *BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
+    if (magic != 0xdeadbeef) @trap();
     boot_info = _boot_info;
-    @memset(boot_info.framebuffer.slice, 123);
+    kmain();
+}
+
+fn kmain() noreturn {
+    std.log.debug("Starting kernel...", .{});
+    for (0..100) |i| framebuffer.putPixel(i, i, .{ .r = 0, .g = 255, .b = 0 });
 
     std.log.debug("Halting", .{});
     while (true) {}
