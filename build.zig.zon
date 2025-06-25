@@ -1,0 +1,8 @@
+.{
+    .name = .serix,
+    .version = "0.0.0",
+    .fingerprint = 0xc93cffed52a3ea8f,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{},
+    .paths = .{""},
+}
