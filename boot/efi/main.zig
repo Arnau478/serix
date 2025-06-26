@@ -25,6 +25,42 @@ fn logFn(comptime level: std.log.Level, comptime _: @Type(.enum_literal), compti
     writer.print(level.asText() ++ ": " ++ format ++ "\r\n", args) catch |err| switch (err) {};
 }
 
+const UefiMemoryMap = struct {
+    data: []align(8) u8,
+    descriptor_size: usize,
+    key: usize,
+};
+
+fn getMemoryMap() error{MemoryMapError}!UefiMemoryMap {
+    const boot_services = uefi.system_table.boot_services.?;
+
+    var memory_map_ptr: [*]align(8) u8 = undefined;
+    var memory_map_size: usize = 0;
+    var memory_map_key: usize = 0;
+    var descriptor_size: usize = 0;
+    var descriptor_version: u32 = 0;
+
+    // This should fail with buffer_too_small, but return the size
+    if (boot_services.getMemoryMap(&memory_map_size, null, &memory_map_key, &descriptor_size, &descriptor_version) != .buffer_too_small) return error.MemoryMapError;
+
+    // Allocation can create up to 2 new descriptors
+    memory_map_size += 2 * descriptor_size;
+
+    // Allocate pool memory for the memory map
+    if (boot_services.allocatePool(.loader_data, memory_map_size, &memory_map_ptr) != .success) return error.MemoryMapError;
+
+    // Get the memory map, it should now succeed
+    if (boot_services.getMemoryMap(&memory_map_size, @ptrCast(memory_map_ptr), &memory_map_key, &descriptor_size, &descriptor_version) != .success) return error.MemoryMapError;
+
+    std.debug.assert(memory_map_size % descriptor_size == 0);
+
+    return .{
+        .data = memory_map_ptr[0..memory_map_size],
+        .descriptor_size = descriptor_size,
+        .key = memory_map_key,
+    };
+}
+
 pub fn main() void {
     const boot_services = uefi.system_table.boot_services.?;
     const con_out = uefi.system_table.con_out.?;
@@ -34,16 +70,6 @@ pub fn main() void {
     log_con_out = con_out;
 
     std.log.debug("Booting...", .{});
-
-    std.log.debug("Getting memory map...", .{});
-    var memory_map: [*]uefi.tables.MemoryDescriptor = undefined;
-    var memory_map_size: usize = 0;
-    var memory_map_key: usize = undefined;
-    var memory_map_descriptor_size: usize = undefined;
-    var memory_map_descriptor_version: u32 = undefined;
-    while (boot_services.getMemoryMap(&memory_map_size, memory_map, &memory_map_key, &memory_map_descriptor_size, &memory_map_descriptor_version) == .buffer_too_small) {
-        if (boot_services.allocatePool(.boot_services_data, memory_map_size, @ptrCast(&memory_map)) != .success) return;
-    }
 
     std.log.debug("Opening kernel...", .{});
     var fs: *uefi.protocol.SimpleFileSystem = undefined;
@@ -112,23 +138,60 @@ pub fn main() void {
 
     const boot_info = uefi.pool_allocator.create(BootInfo) catch return;
     std.log.debug("Boot info at 0x{x}", .{@intFromPtr(boot_info)});
+
     boot_info.* = .{
         .framebuffer = .{
             .slice = @as([*]u8, @ptrFromInt(graphics.mode.frame_buffer_base))[0..graphics.mode.frame_buffer_size],
             .width = graphics.mode.info.horizontal_resolution,
             .height = graphics.mode.info.vertical_resolution,
         },
+        .memory_map = undefined, // This is done later
     };
 
-    // Update memory map for exitBootServices
-    // TODO: Can the allocatePool be a problem?
-    memory_map_size = 0;
-    while (boot_services.getMemoryMap(&memory_map_size, memory_map, &memory_map_key, &memory_map_descriptor_size, &memory_map_descriptor_version) == .buffer_too_small) {
-        if (boot_services.allocatePool(.boot_services_data, memory_map_size, @ptrCast(&memory_map)) != .success) return;
+    var uefi_memory_map = getMemoryMap() catch return;
+    const memory_map_data = uefi.pool_allocator.alloc(BootInfo.MemoryMapEntry, @divExact(uefi_memory_map.data.len, uefi_memory_map.descriptor_size) + 2) catch return;
+    uefi_memory_map = getMemoryMap() catch return;
+    var memory_map_len: usize = 0;
+
+    var uefi_i: usize = 0;
+    while (uefi_i < @divExact(uefi_memory_map.data.len, uefi_memory_map.descriptor_size)) : (uefi_i += 1) {
+        const uefi_entry = @as(*uefi.tables.MemoryDescriptor, @ptrCast(@alignCast(&uefi_memory_map.data[uefi_memory_map.descriptor_size * uefi_i]))).*;
+        std.log.debug("{}: {s} at 0x{x} with {} pages", .{ uefi_i, @tagName(uefi_entry.type), uefi_entry.physical_start, uefi_entry.number_of_pages });
+
+        const memory_type: BootInfo.MemoryMapEntry.Type = switch (uefi_entry.type) {
+            .conventional_memory, .boot_services_code, .boot_services_data => .usable,
+            .loader_code, .loader_data => .loader_and_kernel,
+            .acpi_reclaim_memory => .acpi,
+            .acpi_memory_nvs => .nvs,
+            .memory_mapped_io, .memory_mapped_io_port_space => .mmio,
+            .runtime_services_code,
+            .runtime_services_data,
+            .unusable_memory,
+            .pal_code,
+            .persistent_memory,
+            => .reserved,
+            .reserved_memory_type, .max_memory_type => .unknown,
+            _ => .unknown,
+        };
+        if (memory_map_len > 0 and
+            memory_map_data[memory_map_len - 1].type == memory_type and
+            memory_map_data[memory_map_len - 1].start + memory_map_data[memory_map_len - 1].length == uefi_entry.physical_start)
+        {
+            memory_map_data[memory_map_len - 1].length += uefi_entry.number_of_pages * 4096;
+        } else {
+            memory_map_data[memory_map_len] = .{
+                .type = memory_type,
+                .start = uefi_entry.physical_start,
+                .length = uefi_entry.number_of_pages * 4096,
+            };
+
+            memory_map_len += 1;
+        }
     }
+    boot_info.memory_map = memory_map_data[0..memory_map_len];
 
     std.log.debug("Running kernel...", .{});
-    if (boot_services.exitBootServices(uefi.handle, memory_map_key) == .success) {
+    if (boot_services.exitBootServices(uefi.handle, uefi_memory_map.key) == .success) {
         kernel_entry(0xdeadbeef, boot_info);
     } else {
         while (true) {}

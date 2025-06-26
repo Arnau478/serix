@@ -69,13 +69,23 @@ pub const std_options: std.Options = .{
     .logFn = logFn,
 };
 
-fn logFn(comptime level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
-    _ = level;
-    _ = scope;
-    _ = format;
-    _ = args;
+const LogWriter = std.io.Writer(void, error{}, logWrite);
 
-    // TODO
+// TODO: Write a general "real" write function
+fn logWrite(_: void, bytes: []const u8) error{}!usize {
+    for (bytes) |byte| {
+        asm volatile ("outb %[data], %[port]"
+            :
+            : [data] "{al}" (byte),
+              [port] "N{dx}" (0xE9),
+        );
+    }
+    return bytes.len;
+}
+
+fn logFn(comptime level: std.log.Level, comptime _: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
+    const writer = LogWriter{ .context = {} };
+    writer.print(level.asText() ++ ": " ++ format ++ "\n", args) catch |err| switch (err) {};
 }
 
 export fn _start(magic: usize, _boot_info: *BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
@@ -86,7 +96,10 @@ export fn _start(magic: usize, _boot_info: *BootInfo) callconv(.{ .x86_64_sysv =
 
 fn kmain() noreturn {
     std.log.debug("Starting kernel...", .{});
-    for (0..100) |i| framebuffer.putPixel(i, i, .{ .r = 0, .g = 255, .b = 0 });
+
+    for (boot_info.memory_map, 0..) |entry, i| {
+        std.log.debug("Memory map entry {d:0>2}: {s:<18} 0x{x} -- 0x{x}", .{ i, @tagName(entry.type), entry.start, entry.start + entry.length });
+    }
 
     std.log.debug("Halting", .{});
     while (true) {}
